@@ -33,6 +33,7 @@ jobs:
             any::httr
             any::jsonlite
             any::data.table
+            any::xml2
 
       - name: Run scraper
         run: Rscript data/get-nyrr-data.R
