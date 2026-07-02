@@ -285,7 +285,7 @@ main <- function() {
         return(invisible(NULL))
       }
 
-      load_runner_results(runner_ids, wait_sec = 0.1)
+      load_runner_results(runner_ids, wait_sec = 1)
 
       log_msg("Scrape run finished successfully.", only_log = FALSE)
     },
