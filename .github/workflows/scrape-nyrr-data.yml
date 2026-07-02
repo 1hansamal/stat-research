@@ -2,10 +2,12 @@ name: Scrape NYRR Marathon Data
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/59 * * * *"   # Run every 15 minutes
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - 'data/get-nyrr-data.R'
+      - "data/get-nyrr-data.R"
 
 permissions:
   contents: write
@@ -13,35 +15,49 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # GitHub's hard cap on a job is 360 minutes, this just guards against a hang
-    timeout-minutes: 350
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.6.1'
+          r-version: "4.6.1"
           use-public-rspm: true
 
-      - name: Install R package dependencies
+      - name: Cache installed R packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.R_LIBS_USER }}
+          key: ${{ runner.os }}-r-4.6.1-${{ hashFiles('data/get-nyrr-data.R') }}
+          restore-keys: |
+            ${{ runner.os }}-r-4.6.1-
+
+      - name: Install R packages
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
           packages: |
             any::httr
             any::jsonlite
             any::data.table
-            any::xml2
 
       - name: Run scraper
         run: Rscript data/get-nyrr-data.R
 
-      - name: Commit and push data files
+      - name: Commit updated data
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/csv data/log
-          git diff --cached --quiet || git commit -m "Update NYRR data [skip ci]"
-          git push
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/csv
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update NYRR data [skip ci]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
