@@ -3,7 +3,7 @@ name: Scrape NYRR Marathon Data
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/59 * * * *"   # Run every 15 minutes
+    - cron: "0 */6 * * *"   # Run every 15 minutes
   push:
     branches: [main]
     paths:
