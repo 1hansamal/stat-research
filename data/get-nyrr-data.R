@@ -1,0 +1,256 @@
+# This script is inspired by the Python code originally written by
+# bonyejekwe, from the "Marathon_Predictor" repository:
+#   https://github.com/bonyejekwe/Marathon_Predictor
+
+library(httr)
+library(jsonlite)
+library(data.table)
+
+path_runner_ids <- "data/csv/nyrr_runner_ids.csv"
+path_runner_results <- "data/csv/nyrr_runner_results.csv"
+path_runner_splits <- "data/csv/nyrr_runner_splits.csv"
+path_log <- "data/csv/nyrr_scrape.log"
+
+dir.create("data/csv", recursive = TRUE, showWarnings = FALSE)
+
+log_msg <- function(...) {
+  line <- sprintf("[%s] %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), sprintf(...))
+  cat(line, "\n")
+  cat(line, "\n", file = path_log, append = TRUE)
+}
+
+## get the runners ids for scrapping results -----------------------------------
+# return JSON object if request is successful, else return NULL
+get_runner_ids <- function(event_code = "M2022", from_place = 1, to_place = 100) {
+  url <- "https://rmsprodapi.nyrr.org/api/v2/runners/finishers-filter"
+
+  request_body <- list(
+    eventCode = event_code,
+    sortColumn = "overallTime",
+    sortDescending = FALSE,
+    overallPlaceFrom = from_place,
+    overallPlaceTo = to_place
+  )
+
+  attempts <- 3
+
+  for (attempt in 1:attempts) {
+    response <- tryCatch(
+      POST(
+        url,
+        add_headers(`content-type` = "application/json;charset=UTF-8"),
+        body = toJSON(request_body, auto_unbox = TRUE),
+        encode = "raw",
+        timeout(10)
+      ),
+      error = function(e) NULL
+    )
+
+    if (!is.null(response) || status_code(response) == 200) {
+      response <- content(response, simplifyVector = FALSE)
+
+      log_msg("received %i items", length(response[["items"]]))
+      return(response[["items"]])
+    }
+
+    log_msg(
+      "Couldn't fetch ids from: %i to: %i, attempt: %i. Trying again...",
+      from_place, to_place, attempt
+    )
+
+    Sys.sleep(1)
+  }
+
+  log_msg(
+    "Couldn't fetch ids: %i-%i after %i attempts",
+    from_place, to_place, attempts
+  )
+
+  return(NULL)
+}
+
+# get the runners results ------------------------------------------------------
+# return JSON object if request is successful, else return runnerId
+get_runner_results <- function(runner_id) {
+  url <- "https://rmsprodapi.nyrr.org/api/v2/runners/resultDetails"
+
+  request_body <- list(runnerId = as.character(runner_id))
+
+  for (attempt in 1:3) {
+    response <- tryCatch(
+      POST(
+        url,
+        add_headers(`content-type` = "application/json;charset=UTF-8"),
+        body = toJSON(request_body, auto_unbox = TRUE),
+        encode = "raw",
+        timeout(10)
+      ),
+      error = function(e) NULL
+    )
+
+    if (!is.null(response) || status_code(response) == 200) {
+      response <- content(response, simplifyVector = FALSE)
+
+      details <- response[["details"]]
+
+      if (is.null(details)) {
+        log_msg("No details found for runner id: %i", runner_id)
+        return(NULL)
+      }
+
+      splits <- details[["splitResults"]]
+      details[["splitResults"]] <- NULL
+
+      log_msg("Received runner details for runner id: %i", runner_id)
+
+      return(list(results = details, splits = splits))
+    }
+
+    log_msg(
+      "Couldn't fetch runner id: %i, attempt: %i. Trying again...", runner_id, attempt
+    )
+
+    Sys.sleep(1)
+  }
+
+  log_msg("Failed to fetch runner id: %i after 3 attempts", runner_id)
+
+  return(NULL)
+}
+
+# load all runner ids from NYRR ------------------------------------------------
+load_runner_ids <- function(event_code = "M2022", batch_size = 100, wait_sec = 1) {
+  from_place <- 1
+  total_rows <- 0
+
+  repeat {
+    to_place <- from_place + batch_size - 1
+
+    response <- get_runner_ids(event_code, from_place, to_place)
+
+    if (is.null(response)) {
+      log_msg(
+        "Failed to fetch places %i-%i. Stopping to avoid missing data.",
+        from_place,
+        to_place
+      )
+      break
+    }
+
+    response <- rbindlist(lapply(response, as.data.table), fill = TRUE)
+
+    fwrite(response, file = path_runner_ids, sep = ",", append = from_place != 1)
+
+    total_rows <- total_rows + nrow(response)
+    log_msg("Loaded %i runner ids (total: %i)", nrow(response), total_rows)
+
+    if (nrow(response) == 0) {
+      log_msg("Received an empty page. Stopping.")
+      break
+    } else if (nrow(response) < batch_size) {
+      log_msg("Received a partial page. Reached end of results.")
+      break
+    }
+
+    from_place <- from_place + batch_size
+    Sys.sleep(wait_sec)
+  }
+
+  log_msg("Done. Total runner ids collected: %i", total_rows)
+}
+
+
+load_runner_results <- function(runner_ids, wait_sec = 0.2) {
+  failed_ids <- integer()
+
+  for (i in seq_along(runner_ids)) {
+    rid <- runner_ids[i]
+
+    response <- get_runner_results(rid)
+
+    if (is.null(response)) {
+      failed_ids <- c(failed_ids, rid)
+
+      log_msg("Skipping runnerId = %s", rid)
+
+      Sys.sleep(wait_sec)
+      next
+    }
+
+    results <- as.data.table(response[["results"]])
+    splits <- rbindlist(lapply(response[["splits"]], as.data.table), fill = TRUE)
+
+    splits[, runnerId := rid]
+    splits <- dcast(splits, runnerId ~ splitCode, value.var = "time")
+
+    append <- i != 1
+    fwrite(results, file = path_runner_results, sep = ",", append = append)
+    fwrite(splits, file = path_runner_splits, sep = ",", append = append)
+
+    log_msg("Processed %i/%i runner ids", i, length(runner_ids))
+
+    Sys.sleep(wait_sec)
+  }
+
+  log_msg(
+    "Done. Successfully fetched %i/%i runners (%i failed).",
+    length(runner_ids) - length(failed_ids),
+    length(runner_ids),
+    length(failed_ids)
+  )
+
+  if (length(failed_ids) > 0) {
+    log_msg("Failed runner ids: %s", paste(failed_ids, collapse = ", "))
+  }
+}
+
+## main ------------------------------------------------------------------------
+main <- function() {
+  tryCatch(
+    {
+      log_msg("Starting NYRR scrape run.")
+
+      if (file.exists(path_runner_ids)) {
+        runner_ids <- unique(
+          fread(path_runner_ids, select = "runnerId")[[1]]
+        )
+      }
+
+      # load_runner_ids(wait_sec = 0.1)
+
+
+      if (length(runner_ids) == 0) {
+        stop("No runner IDs found.")
+      }
+
+      if (file.exists(path_runner_results)) {
+        processed_ids <- unique(
+          fread(path_runner_results, select = "runnerId")[[1]]
+        )
+
+        runner_ids <- setdiff(runner_ids, processed_ids)
+
+        log_msg(
+          "Found %i previously processed runners. %i remaining.",
+          length(processed_ids),
+          length(runner_ids)
+        )
+      }
+
+      if (length(runner_ids) == 0) {
+        log_msg("All runner IDs have already been processed.")
+        return(invisible(NULL))
+      }
+
+      load_runner_results(runner_ids, wait_sec = 0.05)
+
+      log_msg("Scrape run finished successfully.")
+    },
+    error = function(e) {
+      log_msg("Scrape failed: %s", conditionMessage(e))
+      stop(e)
+    }
+  )
+}
+
+main()
