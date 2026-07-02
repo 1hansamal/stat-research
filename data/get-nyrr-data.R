@@ -13,11 +13,33 @@ path_log <- "data/csv/nyrr_scrape.log"
 
 dir.create("data/csv", recursive = TRUE, showWarnings = FALSE)
 
-log_msg <- function(...) {
+log_msg <- function(..., only_log = TRUE) {
   line <- sprintf("[%s] %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), sprintf(...))
-  cat(line, "\n")
+  if (!only_log) cat(line, "\n")
   cat(line, "\n", file = path_log, append = TRUE)
 }
+
+SCRAPE_START <- Sys.time()
+MAX_RUNTIME <- 300 * 60
+
+check_runtime <- function() {
+  elapsed <- as.numeric(difftime(
+    Sys.time(),
+    SCRAPE_START,
+    units = "secs"
+  ))
+
+  if (elapsed >= MAX_RUNTIME) {
+    log_msg(
+      "Maximum runtime (%.1f min) reached. Stopping scraper.",
+      elapsed / 60
+    )
+    return(TRUE)
+  }
+
+  FALSE
+}
+
 
 ## get the runners ids for scrapping results -----------------------------------
 # return JSON object if request is successful, else return NULL
@@ -46,7 +68,7 @@ get_runner_ids <- function(event_code = "M2022", from_place = 1, to_place = 100)
       error = function(e) NULL
     )
 
-    if (!is.null(response) || status_code(response) == 200) {
+    if (!is.null(response) && status_code(response) == 200) {
       response <- content(response, simplifyVector = FALSE)
 
       log_msg("received %i items", length(response[["items"]]))
@@ -55,7 +77,8 @@ get_runner_ids <- function(event_code = "M2022", from_place = 1, to_place = 100)
 
     log_msg(
       "Couldn't fetch ids from: %i to: %i, attempt: %i. Trying again...",
-      from_place, to_place, attempt
+      from_place, to_place, attempt,
+      only_log = FALSE
     )
 
     Sys.sleep(1)
@@ -63,7 +86,8 @@ get_runner_ids <- function(event_code = "M2022", from_place = 1, to_place = 100)
 
   log_msg(
     "Couldn't fetch ids: %i-%i after %i attempts",
-    from_place, to_place, attempts
+    from_place, to_place, attempts,
+    only_log = FALSE
   )
 
   return(NULL)
@@ -88,13 +112,13 @@ get_runner_results <- function(runner_id) {
       error = function(e) NULL
     )
 
-    if (!is.null(response) || status_code(response) == 200) {
+    if (!is.null(response) && status_code(response) == 200) {
       response <- content(response, simplifyVector = FALSE)
 
       details <- response[["details"]]
 
       if (is.null(details)) {
-        log_msg("No details found for runner id: %i", runner_id)
+        log_msg("No details found for runner id: %i", runner_id, only_log = FALSE)
         return(NULL)
       }
 
@@ -107,13 +131,15 @@ get_runner_results <- function(runner_id) {
     }
 
     log_msg(
-      "Couldn't fetch runner id: %i, attempt: %i. Trying again...", runner_id, attempt
+      "Couldn't fetch runner id: %i, attempt: %i. Trying again...",
+      runner_id, attempt,
+      only_log = FALSE
     )
 
     Sys.sleep(1)
   }
 
-  log_msg("Failed to fetch runner id: %i after 3 attempts", runner_id)
+  log_msg("Failed to fetch runner id: %i after 3 attempts", runner_id, only_log = FALSE)
 
   return(NULL)
 }
@@ -131,8 +157,8 @@ load_runner_ids <- function(event_code = "M2022", batch_size = 100, wait_sec = 1
     if (is.null(response)) {
       log_msg(
         "Failed to fetch places %i-%i. Stopping to avoid missing data.",
-        from_place,
-        to_place
+        from_place, to_place,
+        only_log = FALSE
       )
       break
     }
@@ -148,7 +174,7 @@ load_runner_ids <- function(event_code = "M2022", batch_size = 100, wait_sec = 1
       log_msg("Received an empty page. Stopping.")
       break
     } else if (nrow(response) < batch_size) {
-      log_msg("Received a partial page. Reached end of results.")
+      log_msg("Received a partial page. Reached end of results.", only_log = FALSE)
       break
     }
 
@@ -156,14 +182,25 @@ load_runner_ids <- function(event_code = "M2022", batch_size = 100, wait_sec = 1
     Sys.sleep(wait_sec)
   }
 
-  log_msg("Done. Total runner ids collected: %i", total_rows)
+  log_msg("Done. Total runner ids collected: %i", total_rows, only_log = FALSE)
 }
 
 
 load_runner_results <- function(runner_ids, wait_sec = 0.2) {
   failed_ids <- integer()
 
+  append_results <- file.exists(path_runner_results)
+  append_splits <- file.exists(path_runner_splits)
+
   for (i in seq_along(runner_ids)) {
+    if (check_runtime()) {
+      log_msg(
+        "Stopping after processing %i/%i runners.", i - 1, length(runner_ids),
+        only_log = FALSE
+      )
+      return(invisible(NULL))
+    }
+
     rid <- runner_ids[i]
 
     response <- get_runner_results(rid)
@@ -171,7 +208,7 @@ load_runner_results <- function(runner_ids, wait_sec = 0.2) {
     if (is.null(response)) {
       failed_ids <- c(failed_ids, rid)
 
-      log_msg("Skipping runnerId = %s", rid)
+      log_msg("Skipping runnerId = %s", rid, only_log = FALSE)
 
       Sys.sleep(wait_sec)
       next
@@ -183,9 +220,11 @@ load_runner_results <- function(runner_ids, wait_sec = 0.2) {
     splits[, runnerId := rid]
     splits <- dcast(splits, runnerId ~ splitCode, value.var = "time")
 
-    append <- i != 1
-    fwrite(results, file = path_runner_results, sep = ",", append = append)
-    fwrite(splits, file = path_runner_splits, sep = ",", append = append)
+    fwrite(results, file = path_runner_results, append = append_results)
+    append_results <- TRUE
+
+    fwrite(splits, file = path_runner_splits, append = append_splits)
+    append_splits <- TRUE
 
     log_msg("Processed %i/%i runner ids", i, length(runner_ids))
 
@@ -194,9 +233,8 @@ load_runner_results <- function(runner_ids, wait_sec = 0.2) {
 
   log_msg(
     "Done. Successfully fetched %i/%i runners (%i failed).",
-    length(runner_ids) - length(failed_ids),
-    length(runner_ids),
-    length(failed_ids)
+    length(runner_ids) - length(failed_ids), length(runner_ids), length(failed_ids),
+    only_log = FALSE
   )
 
   if (length(failed_ids) > 0) {
@@ -208,46 +246,51 @@ load_runner_results <- function(runner_ids, wait_sec = 0.2) {
 main <- function() {
   tryCatch(
     {
-      log_msg("Starting NYRR scrape run.")
+      log_msg("Starting NYRR scrape run.", only_log = FALSE)
 
-      if (file.exists(path_runner_ids)) {
-        runner_ids <- unique(
-          fread(path_runner_ids, select = "runnerId")[[1]]
-        )
+      # Create runner ID file if it doesn't exist
+      if (!file.exists(path_runner_ids)) {
+        load_runner_ids(wait_sec = 0.5)
       }
 
-      # load_runner_ids(wait_sec = 0.1)
+      # Always read runner IDs after ensuring the file exists
+      runner_ids <- unique(
+        fread(path_runner_ids, select = "runnerId")[[1]]
+      )
 
+      if (length(runner_ids) == 0) stop("No runner IDs found.")
 
-      if (length(runner_ids) == 0) {
-        stop("No runner IDs found.")
-      }
-
+      # Resume from previous run
       if (file.exists(path_runner_results)) {
+        log_msg("Loading processed runner IDs...", only_log = FALSE)
+
         processed_ids <- unique(
-          fread(path_runner_results, select = "runnerId")[[1]]
+          fread(path_runner_results, select = "runnerId", fill = TRUE)[[1]]
         )
+
+        log_msg("Loaded %i processed runner IDs.", length(processed_ids), only_log = FALSE)
 
         runner_ids <- setdiff(runner_ids, processed_ids)
 
-        log_msg(
-          "Found %i previously processed runners. %i remaining.",
-          length(processed_ids),
-          length(runner_ids)
-        )
+        log_msg("%i runners remaining.", length(runner_ids), only_log = FALSE)
       }
 
       if (length(runner_ids) == 0) {
-        log_msg("All runner IDs have already been processed.")
+        log_msg("All runner IDs have already been processed.", only_log = FALSE)
         return(invisible(NULL))
       }
 
-      load_runner_results(runner_ids, wait_sec = 0.05)
+      if (check_runtime()) {
+        log_msg("Maximum runtime reached before processing results.", only_log = FALSE)
+        return(invisible(NULL))
+      }
 
-      log_msg("Scrape run finished successfully.")
+      load_runner_results(runner_ids, wait_sec = 0.1)
+
+      log_msg("Scrape run finished successfully.", only_log = FALSE)
     },
     error = function(e) {
-      log_msg("Scrape failed: %s", conditionMessage(e))
+      log_msg("Scrape failed: %s", conditionMessage(e), only_log = FALSE)
       stop(e)
     }
   )
